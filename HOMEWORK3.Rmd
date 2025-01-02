@@ -1,0 +1,689 @@
+---
+title: "Homework 3 - Cancer Detection for Michigan Medicine"
+author: "Yufei Quan"
+output:
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_depth: 2
+    toc_float:
+      smooth_scroll: true
+    code_folding: hide
+    css: styles.css
+---
+
+<span style="font-size:24px">**Introduction**</span>
+
+The objective of this analysis is to assist Michigan Medicine in utilizing personal health data as a diagnostic tool for early cancer detection. This capstone project focuses on implementing unsupervised learning techniques to identify outliers and clusters in patient health data, hypothesizing that such deviations may correlate with cancer diagnoses. The analysis integrates techniques including outlier detection, clustering, and dimensionality reduction to build a robust framework. This framework will be validated against labeled data, leveraging the sensitivity metric to minimize false negatives as well as precision, both of which are critical in cancer detection scenarios.
+
+Here are the following clustering techniques explored:
+
+- K Means
+- Agnes
+- Diana
+- DBSCAN
+- K Nearest Neighbors (KNN)
+- Isolation Forest
+
+In this analysis, parameters were mostly left to natural constants and methodologies. This way, we can prevent overfitting and loss of external validity. The sample itself was too small to be split effectively into training and testing so a conservative approach was taken. This way, external validity can be kept while keeping analytical power at a maximum. 
+
+Although high accuracy is important, an emphasis was placed on reducing false negatives and overall false diagnoses. This is done to reduce harmful diagnoses in favor of false positives. Therefore, many clustering techniques have been adjusted to achieve this goal. 
+
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(ggbiplot)
+  library(factoextra)
+  library(caret)
+  library(fastDummies)
+  library(knitr)
+  library(tidyr)
+  library(dbscan)
+  library(isotree)
+  library(cluster)
+  library(gridExtra)
+  library(cowplot)
+  library(FNN)
+  library(solitude)
+  library(outliers)
+  library(EnvStats)
+  library(car)
+  library(kableExtra)
+  library(reactable)
+  library(reactablefmtr)
+})
+```
+
+# Load Data
+
+**Data**: The data is split into 31 columns with 30 being the data itself and the last being a label for outcomes. The outcome variable is binary, meaning 1 indicates the patient has cancer and 0 indicates the patient does not have cancer. When we load the data for the first time, we can see there are 378 observations. Given how many dimensions this dataset has, we can consider using PCA to reduce dimensionality. This will help with visualizing data and improve interpretability as well as enhancing clustering which we will run later.
+
+```{r}
+dataraw <- read.csv("wbc.csv")
+
+features <- as.data.frame(scale(dataraw %>% select(-y)))
+labels <- dataraw$y
+dataraw$y <- NULL
+str(dataraw)
+```
+
+Below, we can run PCA to reduce dimensionality:
+
+```{r}
+pca <- prcomp(features, center = TRUE, scale. = TRUE)
+summary(pca)
+
+top_components <- as.data.frame(pca$x[, 1:11])  
+colnames(top_components) <- paste0("PC", 1:11)  
+
+features <- top_components 
+```
+
+If we follow the cumulative proportion in the third row, we can see that 7 components accounts for over 90% of variance and 11 components account for 96%. This means that the last 19 components or so make up the last 4%. In this analysis, we can keep the first 11 since that accounts for the vast majority of our predictive power and will make this more computationally efficient. 
+
+```{r}
+pca_data <- data.frame(
+  PC1 = features[, 1],  # Extract the first principal component
+  PC2 = features[, 2],  # Extract the second principal component
+  Label = as.factor(labels)  # Add labels (0 = Non-Cancer, 1 = Cancer)
+)
+
+cancer_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Label)) +
+  geom_point(size = 3, alpha = 0.7) +  # Use dots for data points
+  scale_color_manual(
+    values = c("0" = "blue", "1" = "red"),  # Map 0 to blue (Non-Cancer), 1 to red (Cancer)
+    labels = c("0" = "Non-Cancer", "1" = "Cancer")  # Update legend labels
+  ) +
+  labs(
+    color = "Patient Status",
+    title = "PCA Graph of Cancer and Non-Cancer Patients in Dataset",  # Add plot title
+    x = "PC1",   # Label for x-axis
+    y = "PC2"    # Label for y-axis
+  ) +
+  theme_minimal() +                 # Use a minimal theme for cleaner visuals
+  theme(legend.position = "right")  # Position the legend to the right
+
+cancer_plot
+```
+
+From the PCA graph above, we can see that a lot of cancer patients are outliers and non cancer patients are grouped together in a cluster. The difficulty is that many cancer patients are also found close to non cancer patients and vice versa.
+
+For clustering techniques, most were kept at 5 clusters. Predictions were made by either choosing 2 clusters with the highest cancer counts or clusters with over 25% cancer positivity rate. The union of these two criteria were chosen to be predicted positives. In addition to this, many clustering techniques were chosen by evaluating precision, sensitivity, and specificity. Although false negatives are the primary focus, we wanted to build a tool that is useful for all cases, rather than overfitting and conforming to a single metric. Therefore, the sums of these three metrics are often used to set parameters. 
+
+```{r}
+compute_metrics <- function(labels, predictions, method = c("clustering", "outlier"), positive_class = NULL, output = TRUE) {
+  method <- match.arg(method)
+  cluster_proportion_df <- NULL
+  
+  if (method == "clustering") {
+    if (is.null(positive_class)) {
+      # Calculate proportions and counts for each cluster
+      cluster_proportion <- tapply(labels, predictions, mean)
+      cluster_counts <- tapply(labels, predictions, length)
+      positive_counts <- tapply(labels, predictions, sum)
+      
+      cluster_proportion_df <- data.frame(
+        Cluster = names(cluster_proportion),
+        Total = cluster_counts,
+        Positive_Count = positive_counts,
+        Proportion_Positive = cluster_proportion
+      )
+      
+      cluster_proportion_df$Cluster <- as.numeric(as.character(cluster_proportion_df$Cluster))
+      
+      cluster_proportion_df <- cluster_proportion_df[order(-cluster_proportion_df$Positive_Count), ]
+      top_2_clusters <- head(cluster_proportion_df$Cluster, 2)
+      threshold_clusters <- cluster_proportion_df$Cluster[cluster_proportion_df$Proportion_Positive >= 0.25]
+      
+      positive_class <- unique(c(top_2_clusters, threshold_clusters))
+    }
+    
+    predicted_class <- ifelse(predictions %in% positive_class, 1, 0)
+    
+  } else if (method == "outlier") {
+    if (is.null(positive_class)) {
+      stop("For outlier detection, 'positive_class' must be specified.")
+    }
+    predicted_class <- ifelse(predictions %in% positive_class, 1, 0)
+  }
+  
+  cfmatrix <- confusionMatrix(
+    data = factor(predicted_class),
+    reference = factor(labels)
+  )
+  if (output) {
+    print(cfmatrix)
+  }
+  
+  sensitivity <- cfmatrix$byClass["Sensitivity"]
+  precision <- cfmatrix$byClass["Precision"]
+  specificity <- cfmatrix$byClass["Specificity"]
+  
+  if (!is.null(cluster_proportion_df)) {
+    return(list(
+      sensitivity = sensitivity, 
+      precision = precision, 
+      specificity = specificity, 
+      proportions = cluster_proportion_df
+    ))
+  } else {
+    return(list(
+      sensitivity = sensitivity, 
+      precision = precision, 
+      specificity = specificity
+    ))
+  }
+}
+```
+
+# K Means Clustering
+
+The first clustering technique is K Means. This method gathers data into k centroids and forms clusters around those points. This process continues until there are no more changes or the maximum number of iterations are reached. Then, we will select the cluster with the highest percent of cancer patients and use that as our prediction. The confusion matrix will be built using this assumption. Below is the implementation.
+
+## Determining Optimal K
+
+The first task in K Means clustering is selecting the number of clusters. We can use elbow, silhouette, and gap stat graphs to determine what k should be. 
+
+```{r}
+wss <- fviz_nbclust(features, kmeans, method = "wss")
+sil <- fviz_nbclust(features, kmeans, method = "silhouette")
+gap <- fviz_nbclust(features, kmeans, method = "gap_stat")
+
+grid.arrange(wss, sil, gap, nrow = 2, ncol = 2)
+k <- 5
+```
+
+From the graphs, we can see a wide range of candidates. Varying k, we find that 2 clusters works the best, providing a good prediction of cancer patients while keeping sensitivity at a reasonable level. 
+
+```{r}
+set.seed(12345)
+km <- kmeans(features, centers = k, nstart = 25)
+
+kmeans_plot <- fviz_cluster(
+  list(data = features[, 1:2], cluster = as.factor(km$cluster)),
+  geom = "point",
+  palette = "jco",  # Adjust colors
+  ellipse.type = "convex",  # Add cluster ellipses
+  ggtheme = theme_minimal(),
+  main = "PCA Cluster Visualization of K Means"
+)
+kmeans_plot
+```
+
+From the cluster visualization above, we can see that cluster 2 (yellow cluster) captures a lot of the outliers who are all cancer patients while the main central cluster is divided into 3. In addition, the bottom most cluster comprises a mix of both cancer and non cancer patients. 
+
+## Confusion Matrix and Results
+
+```{r}
+metrics_kmeans <- compute_metrics(
+  labels = labels, 
+  predictions = km$cluster, 
+  method = "clustering"
+)
+
+kable(metrics_kmeans$proportions)
+
+sensitivity_kmeans <- metrics_kmeans$sensitivity
+precision_kmeans <- metrics_kmeans$precision
+specificity_kmeans <- metrics_kmeans$specificity
+
+cat("KMeans Sensitivity:", sensitivity_kmeans, "\n")
+cat("KMeans Precision:", precision_kmeans, "\n")
+```
+
+We can see that the model is fairly accurate and predicts the vast majority of patients who don't have cancer. In this dataset, we only have 21 cancer patients out of 378 total observations. This is a very limited sample and K Means struggles to classify all of them correctly. 19 cancer patients were correctly classified while 2 were false negatives. 
+
+# Agnes
+
+AGNES, short for Agglomerative Nesting, is a hierarchical clustering method that builds clusters step-by-step from the bottom up. It starts by treating each data point as its own cluster and iteratively merges the closest clusters until all data points are grouped into a single cluster or a desired number of clusters is reached.
+
+## Choosing Linkage Method
+
+One choice we have is the linkage method, governing how the distance between clusters are calculated. There are some popular choices such as average, complete, single, and ward. 
+
+```{r}
+average <- round(agnes(features, method = "average")$ac, 2)
+complete <- round(agnes(features, method = "complete")$ac, 2)
+single <- round(agnes(features, method = "single")$ac, 2)
+ward <- round(agnes(features, method = "ward")$ac, 2)
+
+wards <- agnes(features, method = "ward")
+kable(data.frame(average, complete, single, ward))
+```
+
+From the table, we see that ward is the best linkage method and we will use this for Agnes. 
+
+## Cluster Dendrogram
+
+```{r}
+options(warn=-1)
+k <- 5
+agnes_clusters <- cutree(wards, k=k)
+circular <- fviz_dend(wards, k=k, rect=TRUE, type = "circular")
+branch <- fviz_dend(wards, k=k, rect=TRUE, type = "phylogenic")
+grid.arrange(circular, branch, ncol=2)
+```
+
+From this dendrogram, we see that a lot of the data falls into one cluster and the rest into other smaller clusters. We will use these to build a confusion matrix with similar logic as k means. Other parameters such as distance, linkage method, k were experimented with and this was found to be the best. Each combination has a trade off of sensitivity, specificity, and precision but this method seems to strike a balance between all three. 
+
+```{r}
+agnes_plot <- fviz_cluster(
+  list(data = features[, 1:2], cluster = agnes_clusters),
+  geom = "point",
+  palette = "jco",  # Adjust colors
+  ellipse.type = "convex",  # Add cluster ellipses
+  ggtheme = theme_minimal(),
+  main = "PCA  Visualization of Agnes Clusters"
+)
+```
+
+## Confusion Matrix
+
+```{r}
+metrics_agnes <- compute_metrics(
+  labels = labels, 
+  predictions = agnes_clusters, 
+  method = "clustering"
+)
+
+kable(metrics_agnes$proportions)
+
+sensitivity_agnes <- metrics_agnes$sensitivity
+precision_agnes <- metrics_agnes$precision
+specificity_agnes <- metrics_agnes$specificity
+
+cat("AGNES Sensitivity:", sensitivity_agnes, "\n")
+cat("AGNES Precision:", precision_agnes, "\n")
+```
+
+This confusion matrix summarizes the performance of a classification model. The accuracy of the model is 93.39%, indicating that the model correctly classified most instances. The sensitivity (recall) of 94.68% shows the model's ability to correctly identify true negatives, while the specificity of 71.43% reflects its performance in identifying true positives.
+
+# Diana
+
+DIANA (Divisive Analysis Clustering) is a hierarchical clustering method that works in a top-down manner. It starts with all data points in a single cluster and iteratively splits them into smaller clusters based on dissimilarity, prioritizing the largest and most heterogeneous clusters first. This approach is particularly useful for identifying natural divisions in data, but it can be computationally expensive for large datasets.
+
+## Cluster Dendrogram
+
+```{r}
+diana <- diana(features)
+k <- 5
+diana_clusters <- cutree(diana, k=k)
+circular <- fviz_dend(diana, k=k, rect=TRUE, type = "circular")
+branch <- fviz_dend(diana, k=k, rect=TRUE, type = "phylogenic")
+grid.arrange(circular, branch, ncol=2)
+  
+diana_plot <- fviz_cluster(
+  list(data = features[, 1:2], cluster = diana_clusters),
+  geom = "point",
+  palette = "jco",  # Adjust colors
+  ellipse.type = "convex",  # Add cluster ellipses
+  ggtheme = theme_minimal(),
+  main = "PCA Cluster Visualization of Diana Clusters"
+)
+```
+
+From the dendrogram, we see most of the data falling into one cluster.
+
+## Confusion Matrix
+
+```{r}
+metrics_diana <- compute_metrics(
+  labels = labels, 
+  predictions = diana_clusters, 
+  method = "clustering"
+)
+
+kable(metrics_diana$proportions)
+
+sensitivity_diana <- metrics_diana$sensitivity
+precision_diana <- metrics_diana$precision
+specificity_diana <- metrics_diana$specificity
+
+cat("DIANA Sensitivity:", sensitivity_diana, "\n")
+cat("DIANA Precision:", precision_diana, "\n")
+```
+
+This confusion matrix shows a model with moderate accuracy (78.57%) and balanced sensitivity (78.43%) and specificity (80.95%), indicating that the model performs relatively well in identifying both true negatives (no cancer) and true positives (cancer). However, the positive predictive value (98.59%) suggests that when the model predicts no cancer, it is highly reliable. Conversely, the negative predictive value (18.09%) highlights its limitations in accurately predicting cancer cases, as a significant proportion of actual cancer cases are missed.
+
+# DBSCAN
+
+DBSCAN is a density-based clustering algorithm that groups data points into clusters based on their proximity and density. It identifies dense regions of points separated by sparser regions, making it particularly effective for detecting irregularly shaped clusters and outliers. In this analysis, outliers will be considered to be cancer patients while those in clusters will be considered to be no cancer. 
+
+## Find optimal eps and min points using grid search
+
+There are 2 main parameters we can change in dbscan: epsilon and min points. We can set the define a range of eps and minpoint values and loop through each combination. For each combination, the score is calculated from the sum of precision, sensitivity, and specificity scores, since those are the ones we're most interested in. The combination that maximizes this score is kept as our eps and min points value for our analysis. 
+
+```{r}
+options(warn = -1) 
+best_eps <- NULL
+best_minpts <- NULL
+best_score <- -Inf  
+
+eps_values <- seq(2.0, 8.0, by = 0.1)  
+minpts_values <- 15:25  
+
+for (eps in eps_values) {
+  for (minpts in minpts_values) {
+    
+    dbscan_result <- dbscan(features, eps = eps, minPts = minpts)
+    
+    metrics_dbscan <- compute_metrics(
+      labels = labels,
+      predictions = dbscan_result$cluster,
+      method = "outlier",
+      positive_class = 0,
+      output = FALSE
+    )
+
+    sensitivity <- metrics_dbscan$sensitivity
+    precision <- metrics_dbscan$precision
+    specificity <- metrics_dbscan$specificity
+    score <- sensitivity + precision + specificity
+
+    if (is.na(score)) {
+      next  # Skip this iteration
+    }
+
+    if (score > best_score) {
+      best_eps <- eps
+      best_minpts <- minpts
+      best_score <- score
+    }
+  }
+}
+
+cat("The best eps value is:", best_eps, "\n")
+cat("The best minPts value is:", best_minpts, "\n")
+cat("The best score is:", best_score, "\n")
+```
+
+## Plot of eps and min points
+
+```{r}
+eps <- best_eps
+minpoints <- best_minpts
+dbscan::kNNdistplot(features, k = 3); abline(h = eps, lty = 2)  
+```
+
+## Display and Visualize Clusters
+
+```{r}
+dbscan_result <- dbscan(features, eps = eps, minPts = minpoints)
+
+pca_data$CancerStatus <- ifelse(dbscan_result$cluster == 1, "Non-Cancer", "Cancer") 
+
+dbscan_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = CancerStatus)) +
+  geom_point(size = 3, alpha = 0.7) + 
+  scale_color_manual(
+    values = c("Cancer" = "red", "Non-Cancer" = "blue") 
+  ) +
+  theme_minimal() +
+  labs(
+    title = "PCA Plot DBSCAN Outliers",
+    x = "PC1",
+    y = "PC2",
+    color = "Patient Status"
+  )
+dbscan_plot
+```
+Outliers are those that do not fall into the main cluster and we will assume to have cancer patients. 
+
+## Confusion Matrix
+
+```{r}
+metrics_dbscan <- compute_metrics(
+  labels = labels, 
+  predictions = dbscan_result$cluster, 
+  method = "outlier", 
+  positive_class = 0  
+)
+
+sensitivity_dbscan <- metrics_dbscan$sensitivity
+precision_dbscan <- metrics_dbscan$precision
+specificity_dbscan <- metrics_dbscan$specificity
+
+cat("DBSCAN Sensitivity:", sensitivity_dbscan, "\n")
+cat("DBSCAN Precision:", precision_dbscan, "\n")
+```
+
+This model does well to capture all patients that have cancer, since all 21 patients were correctly identified. However, 90 other patients were incorrectly classified as cancer patients. On the bright side, we have no false negatives.
+
+# KNN
+
+K-Nearest Neighbors (KNN) is a versatile algorithm often used for outlier detection by assessing the proximity of data points in a multidimensional space. In this approach, a point is considered an outlier if its distance to its nearest neighbors is significantly larger compared to other points in the dataset.
+
+## Choose K
+
+The most important paramter in KNN is the K values. For this, we will go through a sequence ot 2 to 20 to find the most optimal values of K. 
+
+```{r}
+set.seed(12345)
+k_values <- seq(2, 20)
+
+train_control <- trainControl(method = "cv", number = 10)  # 10-fold cross-validation
+
+knn_model <- train(
+  x = features,              # Features data frame
+  y = factor(labels),        # Labels vector converted to factor
+  method = "knn", 
+  tuneGrid = data.frame(k = k_values),
+  trControl = train_control
+)
+
+best_k <- knn_model$bestTune$k
+cat("Optimal k:", best_k, "\n")
+
+plot(knn_model)
+```
+
+The plot above shows the effect on accuracy as k increases. To maximize accuracy, we found k of 2 to be optimal. However, this seems quite low and 5 appears to have good accuracy as well. 
+
+## Run KNN
+
+The other parameter we can tune is the threshold. The threshold is dynamically chosen based on the distribution of KNN scores and the combined performance across key metrics.
+
+```{r}
+options(warn = -1) 
+knn <- get.knn(data = features, k=5)
+head(knn$nn.dist)
+
+knnscore <- rowMeans(knn$nn.dist)
+summary(knnscore)
+
+thresholds <- seq(min(knnscore), max(knnscore), length.out = 100)  # Fine-grained threshold range
+
+results <- sapply(thresholds, function(t) {
+  knn_outlier_labels <- ifelse(knnscore > t, 1, 0)  # Assign labels based on the threshold
+  cfmatrix <- confusionMatrix(factor(knn_outlier_labels), factor(labels))  # Confusion matrix
+  cfmatrix$byClass["Sensitivity"] + cfmatrix$byClass["Specificity"] + cfmatrix$byClass["Precision"]  # Metric sum
+})
+
+threshold <- thresholds[which.max(results)]  # Threshold that maximizes the combined metrics
+cat("The threshold that maximizes metrics for KNN is:", threshold, "\n")
+
+knn_outlier_labels <- ifelse(knnscore > threshold, 1, 0)
+
+metrics_knn <- compute_metrics(
+  labels = labels, 
+  predictions = knn_outlier_labels, 
+  method = "outlier", 
+  positive_class = 1  
+)
+
+sensitivity_knn <- metrics_knn$sensitivity
+precision_knn <- metrics_knn$precision
+specificity_knn <- metrics_knn$specificity
+
+cat("KNN Outlier Sensitivity:", sensitivity_knn, "\n")
+cat("KNN Outlier Precision:", precision_knn, "\n")
+```
+
+```{r}
+knn_plot <- ggplot(features, aes(x = PC1, y = PC2, color = as.factor(knn_outlier_labels))) +
+  geom_point(size = 3, alpha = 0.7) +  # Points for individuals
+  scale_color_manual(
+    values = c("0" = "blue", "1" = "red"),  # Map 0 to blue (Non-Cancer) and 1 to red (Cancer)
+    labels = c("0" = "Non-Cancer", "1" = "Cancer")  # Update legend labels
+  ) +
+  labs(
+    title = "PCA Plot KNN Outlier Detection", 
+    x = "PC1", 
+    y = "PC2",
+    color = "Patient Status"  # Update legend title
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")  # Adjust legend position
+```
+
+The KNN outlier detection model achieves a high sensitivity of 87.39%, indicating that it effectively identifies most true negatives (non-cancer cases). Its specificity of 80.95% shows a balanced ability to detect true positives (cancer cases) while minimizing false positives. The precision of 98.73% highlights that the majority of predictions for non-cancer cases are accurate, making the model highly reliable in this regard.
+
+The model's balanced accuracy of 84.17% reflects its relatively strong performance in detecting both classes (cancer and non-cancer). However, the negative predictive value of 27.42% reveals a limitation in identifying all cancer cases, as some true positives may still be missed.
+
+Overall, KNN offers a good balance between sensitivity and specificity, making it suitable for minimizing false negatives, which is critical in cancer detection. However, there is still room for improvement to enhance the detection of cancer cases and further reduce false negatives.
+
+# Isolation Forest
+
+Isolation Forest is an unsupervised anomaly detection algorithm designed to identify outliers by isolating data points. It works by constructing random decision trees and measuring the number of splits needed to isolate a point. Outliers, being rare and different, require fewer splits compared to inliers.
+
+```{r}
+iso <- isolation.forest(data = as.matrix(dataraw), sample_size = 378)
+dataraw$isoscores <- predict(iso, newdata = as.matrix(dataraw), type = "score")
+
+ggplot(dataraw) + aes(x=isoscores) + geom_density()
+```
+
+## Confusion Matrix
+
+The threshold is calculated by enumerating through 0.01 to 1 and calcualting a sum of metrics. The best one is chosen. 
+
+```{r}
+options(warn = -1) 
+thresholds <- seq(0.01, 1, by = 0.01)
+results <- sapply(thresholds, function(t) {
+  outlier_labels <- ifelse(dataraw$isoscores > t, 1, 0)
+  cfmatrix <- confusionMatrix(factor(outlier_labels), factor(labels))
+  cfmatrix$byClass["Sensitivity"] + cfmatrix$byClass["Specificity"] + cfmatrix$byClass["Precision"] 
+})
+threshold <- thresholds[which.max(results)]
+cat("The threshold that maximizes metrics is:", threshold, "\n")
+
+iso_outlier_labels <- ifelse(dataraw$isoscores > threshold, 1, 0)
+
+metrics_iso <- compute_metrics(
+  labels = labels, 
+  predictions = iso_outlier_labels, 
+  method = "outlier", 
+  positive_class = 1  
+)
+
+sensitivity_iso <- metrics_iso$sensitivity
+precision_iso <- metrics_iso$precision
+specificity_iso <- metrics_iso$specificity
+
+cat("Isolation Forest Sensitivity:", sensitivity_iso, "\n")
+cat("Isolation Forest Precision:", precision_iso, "\n")
+```
+
+```{r}
+iso_plot <- ggplot(features, aes(x = PC1, y = PC2, color = as.factor(iso_outlier_labels))) +
+  geom_point(size = 3, alpha = 0.7) +  # Points for individuals
+  scale_color_manual(
+    values = c("0" = "blue", "1" = "red"),  # Map 0 to blue (Non-Cancer) and 1 to red (Cancer)
+    labels = c("0" = "Non-Cancer", "1" = "Cancer")  # Update legend labels
+  ) +
+  labs(title = "PCA Plot Isolation Forest Outliers", 
+       x = "PC1", 
+       y = "PC2",
+       color = "Patient Status") +  # Legend title
+  theme_minimal() +
+  theme(legend.position = "right")  # Adjust legend position
+
+```
+
+The results for the Isolation Forest model, with a threshold of 0.42, show a moderate sensitivity of 79.83%, meaning the model effectively identifies most true negatives (non-cancer cases). Its specificity of 95.24% indicates strong performance in minimizing false positives, making it reliable at correctly identifying true positives (cancer cases). The model's precision of 99.65% further highlights its high reliability in predicting non-cancer cases.
+
+The balanced accuracy of 87.54% reflects a strong overall performance in detecting both classes (cancer and non-cancer) with reasonable balance. However, the negative predictive value of 21.74% reveals a limitation in its ability to correctly predict cancer cases, with some true positives still being misclassified as non-cancer.
+
+Overall, this Isolation Forest model balances sensitivity and specificity well, making it a suitable candidate for cancer detection. However, its lower sensitivity compared to some other models indicates room for improvement to minimize false negatives, which is critical for ensuring that cancer cases are not missed. Its high specificity and precision make it particularly useful in reducing unnecessary follow-up testing or misclassifications of non-cancer cases.
+
+# Comparing Models
+
+```{r}
+Models <- c("K Means", "Agnes", "Diana", "DBSCAN", "KNN", "Isolation Forest")
+Sensitivities <- c(sensitivity_kmeans, sensitivity_agnes, sensitivity_diana, sensitivity_dbscan, sensitivity_knn, sensitivity_iso)
+Specificities <- c(specificity_kmeans, specificity_agnes, specificity_diana, specificity_dbscan, specificity_knn, specificity_iso)
+Precisions <- c(precision_kmeans, precision_agnes, precision_diana, precision_dbscan, precision_knn, precision_iso)
+
+Sums <- Sensitivities + Specificities + Precisions
+
+results <- data.frame(
+  Model = Models,
+  Sensitivity = round(Sensitivities, 2),
+  Specificity = round(Specificities, 2),
+  Precision = round(Precisions, 2),
+  Sum = round(Sums, 2)
+)
+
+highlight_max <- function(value, max_value) {
+  if (value == max_value) {
+    return("#90EE90")  
+  } else {
+    return(NA)
+  }
+}
+
+reactable(
+  results,
+  columns = list(
+    Sensitivity = colDef(
+      style = function(value) {
+        list(background = highlight_max(value, max(results$Sensitivity, na.rm = TRUE)))
+      }
+    ),
+    Specificity = colDef(
+      style = function(value) {
+        list(background = highlight_max(value, max(results$Specificity, na.rm = TRUE)))
+      }
+    ),
+    Precision = colDef(
+      style = function(value) {
+        list(background = highlight_max(value, max(results$Precision, na.rm = TRUE)))
+      }
+    ),
+    Sum = colDef(
+      style = function(value) {
+        list(background = highlight_max(value, max(results$Sum, na.rm = TRUE)))
+      }
+    )
+  ),
+  defaultColDef = colDef(
+    align = "center"
+  ),
+  bordered = TRUE,
+  highlight = TRUE
+)
+```
+
+Below is a plot of all clustering and outlier techniques compared to the original:
+
+```{r, fig.width=8, fig.height=28}
+grid.arrange(
+  cancer_plot, kmeans_plot, agnes_plot, diana_plot, dbscan_plot, knn_plot, iso_plot,
+  ncol = 1,
+  nrow = 7,
+  heights = c(1, 1, 1, 1, 1, 1, 1) # or another proportional set of values, 
+)
+```
+
+We can see that most of the techniques were able to identify the outliers. Between the clustering methods, there is a noticeable distinction in how the main cluster of non cancer patients was split up. The outlier detection methods are both similar in the points it labeled as outliers with the graphs looking remarkably similar. 
+
+# Conclusion
+
+The table presents a comparison of multiple clustering and outlier detection models, highlighting their performance across sensitivity, specificity, precision, and a combined metric sum. Among the models, Agnes demonstrates the highest sensitivity at 0.95, making it the most effective at minimizing false negatives—critical for ensuring that cancer cases are not missed. KNN and Isolation Forest also perform well in terms of sensitivity, achieving 0.87 and 0.80 respectively, which makes them strong candidates for cancer detection. On the other hand, DBSCAN achieves perfect specificity (1.0) and precision (1.0), meaning it is highly effective at minimizing false positives and ensuring highly reliable predictions. However, DBSCAN’s lower sensitivity of 0.75 means it may miss a significant number of actual cancer cases, which is a limitation in the context of this task.
+
+From a precision standpoint, DBSCAN and Isolation Forest achieve perfect scores (1.0), indicating that when these models predict cancer, the predictions are highly reliable. However, since the primary objective is to minimize false negatives, sensitivity takes precedence over precision in this application. Agnes strikes the best balance between sensitivity and overall performance, as reflected in its strong combined metric sum of 2.64. KNN also performs well overall, with a combined sum of 2.67, reflecting good sensitivity and reasonable specificity.
+
+Overall, this project effectively evaluates multiple approaches to cancer detection, with a clear focus on minimizing false negatives. Agnes stands out as the most suitable model for this task due to its high sensitivity, ensuring that most cancer cases are correctly identified. DBSCAN, with its excellent specificity, could serve as a complementary tool to confirm positive cases and reduce unnecessary testing. The combination of these models provides a robust strategy for detecting cancer while balancing the trade-offs between sensitivity, specificity, and precision.
+
+<span style="font-size:18px">**The patient data shows strong potential for cancer detection when combined with unsupervised learning methodologies such as clustering and outlier detection, although limitations and cautions are still present**</span>
